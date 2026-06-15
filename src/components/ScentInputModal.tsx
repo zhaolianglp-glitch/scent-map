@@ -1,161 +1,272 @@
-// ScentInputModal — 点击地图后弹出的气味输入框
+// 气味输入弹窗 — 浮动气泡，灵动有趣
+// 支持自由输入 + 预定义词库建议 + 智能颜色匹配
 import { useState, useEffect, useRef } from 'react';
-import { useAppStore } from '../store/useMapStore';
 import { SMELL_PALETTE } from '../utils/colorPalette';
+import type { OKLCH } from '../utils/oklch';
 
-// 文字→颜色映射（简单关键词匹配 + 随机 fallback）
-function textToColor(text: string): { L: number; C: number; H: number } {
-  const lower = text.toLowerCase();
-
-  // 关键词匹配
-  for (const item of SMELL_PALETTE) {
-    if (lower.includes(item.keyword)) {
-      return { ...item.oklch };
-    }
-  }
-
-  // 情感/语义启发式映射
-  if (/好吃|香|甜|美食|面包|烧烤|肉/.test(lower)) {
-    return { L: 0.75, C: 0.15, H: 40 + Math.random() * 30 }; // 暖橙
-  }
-  if (/臭|垃圾|污|脏/.test(lower)) {
-    return { L: 0.4, C: 0.12, H: 60 + Math.random() * 20 }; // 暗黄绿
-  }
-  if (/花|香|清新|草|树/.test(lower)) {
-    return { L: 0.75, C: 0.12, H: 120 + Math.random() * 60 }; // 绿/粉
-  }
-  if (/雨|水|江|河|海|湿/.test(lower)) {
-    return { L: 0.7, C: 0.08, H: 220 + Math.random() * 30 }; // 蓝
-  }
-  if (/雪|冰|冷|冬/.test(lower)) {
-    return { L: 0.9, C: 0.04, H: 230 }; // 冷白
-  }
-  if (/暖|阳|光|热/.test(lower)) {
-    return { L: 0.85, C: 0.14, H: 50 + Math.random() * 20 }; // 金黄
-  }
-  if (/夜|暗|黑|晚/.test(lower)) {
-    return { L: 0.3, C: 0.08, H: 260 + Math.random() * 40 }; // 深紫
-  }
-  if (/旧|老|古|砖/.test(lower)) {
-    return { L: 0.55, C: 0.1, H: 30 + Math.random() * 15 }; // 棕
-  }
-
-  // 随机从调色板选一个
-  const palette = SMELL_PALETTE[Math.floor(Math.random() * SMELL_PALETTE.length)];
-  return { ...palette.oklch };
+interface Props {
+  center: { x: number; y: number } | null;
+  onClose: () => void;
+  onConfirm: (keyword: string, oklch: OKLCH) => void;
 }
 
-export function ScentInputModal() {
-  const { modalOpen, modalPosition, closeModal, addUserSmell } = useAppStore();
+// 所有已知词汇（用于输入过滤）
+const ALL_KEYWORDS = SMELL_PALETTE.map(p => p.keyword);
+
+/**
+ * 为新词汇生成稳定的 OKLCH 颜色（确定性哈希）
+ * L: 0.58-0.72（适中亮度）、C: 0.10-0.24（柔和饱和度）、H: 0-360（全色相）
+ */
+function hashColor(text: string): OKLCH {
+  let h = 0;
+  for (let i = 0; i < text.length; i++) {
+    h = ((h << 5) - h) + text.charCodeAt(i);
+    h |= 0;
+  }
+  const absH = Math.abs(h);
+  return {
+    L: 0.58 + (absH % 1400) / 10000,         // 0.58 ~ 0.72
+    C: 0.10 + (absH % 1400) / 10000,          // 0.10 ~ 0.24
+    H: ((absH * 31 + 7) % 3600) / 10,        // 0 ~ 360
+  };
+}
+
+export function ScentInputModal({ center, onClose, onConfirm }: Props) {
   const [text, setText] = useState('');
-  const [previewColor, setPreviewColor] = useState({ L: 0.6, C: 0.1, H: 30 });
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [selectedIndex, setSelectedIndex] = useState(-1);
+  const [animState, setAnimState] = useState<'enter' | 'idle' | 'exit'>('enter');
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // 打开时自动聚焦
-  useEffect(() => {
-    if (modalOpen) {
-      setText('');
-      setPreviewColor({ L: 0.6, C: 0.1, H: 30 });
-      setTimeout(() => inputRef.current?.focus(), 100);
-    }
-  }, [modalOpen]);
+  // 当前匹配的颜色
+  const matchedPalette = SMELL_PALETTE.find(p => p.keyword === text.trim());
+  const previewColor = matchedPalette
+    ? matchedPalette.oklch
+    : text.trim() ? hashColor(text.trim()) : null;
 
-  // 实时预览颜色
   useEffect(() => {
-    if (text.trim().length > 0) {
-      setPreviewColor(textToColor(text.trim()));
+    if (center) {
+      setAnimState('enter');
+      setTimeout(() => setAnimState('idle'), 50);
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 100);
     }
+  }, [center]);
+
+  // 过滤建议
+  useEffect(() => {
+    const q = text.trim();
+    if (q) {
+      setSuggestions(
+        ALL_KEYWORDS.filter(k => k.includes(q)).slice(0, 6)
+      );
+    } else {
+      setSuggestions(ALL_KEYWORDS.slice(0, 6));
+    }
+    setSelectedIndex(-1);
   }, [text]);
 
-  if (!modalOpen || !modalPosition) return null;
+  const handleConfirm = (keyword: string) => {
+    const palette = SMELL_PALETTE.find(p => p.keyword === keyword);
+    const oklch = palette ? palette.oklch : hashColor(keyword);
+    setAnimState('exit');
+    setTimeout(() => {
+      onConfirm(keyword, oklch);
+    }, 150);
+  };
 
-  const handleSubmit = () => {
-    const keyword = text.trim();
-    if (!keyword) return;
-    const color = textToColor(keyword);
-    addUserSmell(modalPosition.lng, modalPosition.lat, keyword, color);
-    closeModal();
+  const handleClose = () => {
+    setAnimState('exit');
+    setTimeout(() => {
+      onClose();
+    }, 150);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') handleSubmit();
-    if (e.key === 'Escape') closeModal();
+    if (e.key === 'Escape') {
+      handleClose();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const keyword = selectedIndex >= 0 && suggestions[selectedIndex]
+        ? suggestions[selectedIndex]
+        : text.trim();
+      if (keyword) handleConfirm(keyword);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setSelectedIndex(i => Math.min(i + 1, suggestions.length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setSelectedIndex(i => Math.max(i - 1, -1));
+    }
   };
 
-  const previewCss = `oklch(${(previewColor.L * 100).toFixed(0)}% ${previewColor.C.toFixed(2)} ${previewColor.H.toFixed(0)})`;
+  if (!center) return null;
+
+  const x = Math.min(Math.max(center.x - 140, 10), window.innerWidth - 300);
+  const y = Math.min(Math.max(center.y - 160, 10), window.innerHeight - 300);
 
   return (
-    <div
-      className="absolute inset-0 z-30 flex items-center justify-center pointer-events-auto"
-      style={{ background: 'rgba(0,0,0,0.15)' }}
-      onClick={closeModal}
-    >
+    <>
+      {/* 遮罩（点击关闭） */}
       <div
-        className="bg-white/90 backdrop-blur-md rounded-2xl shadow-2xl p-6 w-80"
+        onClick={handleClose}
         style={{
-          boxShadow: `0 8px 40px rgba(0,0,0,0.12), 0 0 60px ${previewCss}20`,
+          position: 'fixed', inset: 0, zIndex: 1000, background: 'transparent',
         }}
-        onClick={(e) => e.stopPropagation()}
+      />
+
+      {/* 浮动气泡 */}
+      <div
+        style={{
+          position: 'fixed',
+          left: x,
+          top: y,
+          zIndex: 1001,
+          width: 280,
+          transform: animState === 'exit'
+            ? 'scale(0.8) translateY(10px)'
+            : animState === 'enter'
+            ? 'scale(0.8) translateY(10px)'
+            : 'scale(1) translateY(0)',
+          opacity: animState === 'exit' ? 0 : 1,
+          transition: 'all 0.15s cubic-bezier(0.34, 1.56, 0.64, 1)',
+        }}
       >
-        <div className="text-center mb-4">
-          <div
-            className="w-12 h-12 rounded-full mx-auto mb-2"
-            style={{
-              background: previewCss,
-              boxShadow: `0 0 30px ${previewCss}60`,
-              transition: 'all 0.3s ease',
-            }}
-          />
-          <p className="text-xs text-gray-400 font-mono">
-            {text ? previewCss : '输入气味描述'}
-          </p>
+        <div style={{
+          background: 'rgba(255,255,255,0.97)',
+          backdropFilter: 'blur(16px)',
+          borderRadius: 16,
+          padding: 14,
+          boxShadow: '0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.06)',
+          border: '1px solid rgba(0,0,0,0.06)',
+        }}>
+          {/* 输入行 + 颜色预览 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {previewColor && (
+              <span style={{
+                width: 18,
+                height: 18,
+                borderRadius: '50%',
+                flexShrink: 0,
+                background: `oklch(${previewColor.L} ${previewColor.C} ${previewColor.H})`,
+                border: '1px solid rgba(0,0,0,0.1)',
+              }} />
+            )}
+            <input
+              ref={inputRef}
+              type="text"
+              value={text}
+              onChange={e => setText(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="你闻到了什么？自由输入..."
+              style={{
+                flex: 1,
+                border: 'none',
+                outline: 'none',
+                fontSize: 15,
+                background: 'transparent',
+                color: '#333',
+                fontFamily: 'inherit',
+              }}
+            />
+            {text.trim() && (
+              <button
+                onMouseDown={e => { e.preventDefault(); handleConfirm(text.trim()); }}
+                style={{
+                  background: '#333',
+                  border: 'none',
+                  color: '#fff',
+                  fontSize: 12,
+                  padding: '4px 10px',
+                  borderRadius: 14,
+                  cursor: 'pointer',
+                  flexShrink: 0,
+                }}
+              >
+                确认
+              </button>
+            )}
+            <button
+              onClick={handleClose}
+              style={{
+                background: 'none',
+                border: 'none',
+                fontSize: 16,
+                cursor: 'pointer',
+                color: '#999',
+                padding: '2px 6px',
+                borderRadius: 4,
+              }}
+            >
+              ✕
+            </button>
+          </div>
+
+          {/* 建议词列表 */}
+          {suggestions.length > 0 && (
+            <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+              {suggestions.map((kw, i) => {
+                const palette = SMELL_PALETTE.find(p => p.keyword === kw);
+                return (
+                  <button
+                    key={kw}
+                    onMouseDown={e => { e.preventDefault(); handleConfirm(kw); }}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      padding: '4px 10px',
+                      borderRadius: 20,
+                      border: 'none',
+                      fontSize: 12,
+                      cursor: 'pointer',
+                      background: i === selectedIndex ? '#f0f0f0' : 'transparent',
+                      color: '#555',
+                      transition: 'all 0.1s',
+                    }}
+                  >
+                    {palette && (
+                      <span style={{
+                        display: 'inline-block',
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
+                        flexShrink: 0,
+                        background: `oklch(${palette.oklch.L} ${palette.oklch.C} ${palette.oklch.H})`,
+                      }} />
+                    )}
+                    {kw}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* 提示：自由输入也支持 */}
+          {text.trim() && !matchedPalette && (
+            <div style={{
+              marginTop: 6,
+              fontSize: 10,
+              color: '#aaa',
+              textAlign: 'center',
+            }}>
+              新词"{text.trim()}"将自动生成专属颜色
+            </div>
+          )}
         </div>
 
-        <input
-          ref={inputRef}
-          type="text"
-          value={text}
-          onChange={(e) => setText(e.target.value.slice(0, 20))}
-          onKeyDown={handleKeyDown}
-          placeholder="你闻到了什么？"
-          maxLength={20}
-          className="w-full px-4 py-3 rounded-xl border border-gray-200 bg-white/80
-                     text-center text-lg font-serif text-gray-800
-                     placeholder:text-gray-300
-                     focus:outline-none focus:ring-2 focus:ring-gray-300
-                     transition-all duration-200"
-          style={{
-            borderColor: text ? previewCss : '#e5e7eb',
-            boxShadow: text ? `0 0 20px ${previewCss}20` : 'none',
-          }}
-        />
-
-        <p className="text-xs text-gray-400 text-center mt-2 font-mono">
-          {text.length}/20 · Enter 确认 · Esc 取消
-        </p>
-
-        <div className="flex gap-2 mt-4">
-          <button
-            onClick={closeModal}
-            className="flex-1 py-2 rounded-xl text-sm text-gray-500
-                       bg-gray-100 hover:bg-gray-200 transition-colors"
-          >
-            取消
-          </button>
-          <button
-            onClick={handleSubmit}
-            disabled={!text.trim()}
-            className="flex-1 py-2 rounded-xl text-sm text-white font-medium
-                       transition-all duration-200 disabled:opacity-30"
-            style={{
-              background: text.trim() ? previewCss : '#d1d5db',
-              boxShadow: text.trim() ? `0 4px 15px ${previewCss}40` : 'none',
-            }}
-          >
-            标记气味
-          </button>
-        </div>
+        {/* 气泡尾巴 */}
+        <div style={{
+          width: 0, height: 0,
+          borderLeft: '8px solid transparent',
+          borderRight: '8px solid transparent',
+          borderTop: '8px solid rgba(255,255,255,0.97)',
+          margin: '0 auto',
+          position: 'relative',
+          top: -1,
+        }} />
       </div>
-    </div>
+    </>
   );
 }

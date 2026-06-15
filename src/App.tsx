@@ -1,41 +1,67 @@
-// App 根组件
-import { MapContainer } from './components/MapContainer';
+import { useState, useCallback, useRef } from 'react';
 import { Header } from './components/Header';
-import { StatusBar } from './components/StatusBar';
-import { Legend } from './components/Legend';
+import { MapContainer } from './components/MapContainer';
 import { ScentInputModal } from './components/ScentInputModal';
+import type { SmellPoint } from './data/mockSmells';
+import type { OKLCH } from './utils/oklch';
+import { MOCK_SMELLS } from './data/mockSmells';
+
+interface ClickPos {
+  lng: number;
+  lat: number;
+  x: number;
+  y: number;
+}
 
 export default function App() {
+  const [smells, setSmells] = useState<SmellPoint[]>(MOCK_SMELLS);
+  const [clickPos, setClickPos] = useState<ClickPos | null>(null);
+  const clickPosRef = useRef<ClickPos | null>(null);
+
+  const handleMapClick = useCallback((pos: ClickPos) => {
+    clickPosRef.current = pos;
+    setClickPos(pos);
+  }, []);
+
+  const handleCloseModal = useCallback(() => {
+    setClickPos(null);
+  }, []);
+
+  const handleAddSmell = useCallback((keyword: string, oklch: OKLCH) => {
+    const pos = clickPosRef.current;
+    if (!pos) return;
+    setClickPos(null);
+
+    const newSmell: SmellPoint = {
+      id: `smell-custom-${Date.now()}`,
+      position: [pos.lng, pos.lat],
+      keyword,
+      oklch,
+      intensity: 0.8,
+      age: 1,
+      size: 70,
+      phase: Math.random() * Math.PI * 2,
+      avatar: '👤',
+      username: '我',
+      message: `我闻到了${keyword}的味道`,
+    };
+    setSmells(prev => [...prev, newSmell]);
+  }, []);
+
   return (
-    <div className="relative w-screen h-screen overflow-hidden bg-paper">
-      {/* 地图层 */}
-      <MapContainer />
-
-      {/* 气味输入模态框 */}
-      <ScentInputModal />
-
-      {/* UI 层 */}
+    <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', position: 'relative' }}>
       <Header />
-      <StatusBar />
-      <Legend />
-
-      {/* 顶部渐变：标题区背景，从浅米色到透明 */}
-      <div
-        className="absolute top-0 left-0 right-0 h-48 pointer-events-none z-10"
-        style={{
-          background:
-            'linear-gradient(180deg, oklch(0.97 0.01 80 / 0.85) 0%, oklch(0.97 0.01 80 / 0) 100%)',
-        }}
+      <MapContainer
+        smells={smells}
+        onMapClick={handleMapClick}
       />
-
-      {/* 底部渐变：图例区背景 */}
-      <div
-        className="absolute bottom-0 left-0 right-0 h-72 pointer-events-none z-10"
-        style={{
-          background:
-            'linear-gradient(0deg, oklch(0.97 0.01 80 / 0.7) 0%, oklch(0.97 0.01 80 / 0) 100%)',
-        }}
-      />
+      {clickPos && (
+        <ScentInputModal
+          center={{ x: clickPos.x, y: clickPos.y }}
+          onClose={handleCloseModal}
+          onConfirm={handleAddSmell}
+        />
+      )}
     </div>
   );
 }

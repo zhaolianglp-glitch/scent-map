@@ -1,11 +1,45 @@
-// SmellCanvas: Canvas 2D 覆盖层渲染气味点
-// 离屏 Canvas + 加法混合 + Bloom 辉光 + 噪声边缘 + Curl Noise 流场
+// SmellCanvas: 优雅的"水滴"气味可视化
+// 核心：每个气味渲染 3 层（halo + teardrop + core），不用 trail buffer
+// 1. Halo — 大柔和圆（无方向，氛围）
+// 2. Teardrop — 沿风向的贝塞尔曲线水滴（拖尾）
+// 3. Core — 小亮圆点（源头）
+// 所有层缓慢呼吸 + 微微扰动
+// 不同气味 personality 不同（尺寸/长度/呼吸速率/色相）
 import { useEffect, useRef } from 'react';
 import type { Map as MapLibreMap } from 'maplibre-gl';
 import { MOCK_SMELLS, type SmellPoint } from '../data/mockSmells';
 import { oklchToRgb255 } from '../utils/oklch';
-import { simplex2, curlNoise } from '../utils/simplex';
 import { useAppStore } from '../store/useMapStore';
+
+interface Personality {
+  haloScale: number;     // 0.8 - 1.3
+  trailLength: number;   // 0.5 - 1.6
+  trailWidth: number;    // 0.7 - 1.3
+  wobbleAmp: number;     // 0.0 - 1.0
+  breathRate: number;    // 0.18 - 0.45 (慢)
+  coreSize: number;      // 0.8 - 1.2
+}
+
+function hashId(id: string): number {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) {
+    h = ((h << 5) - h) + id.charCodeAt(i);
+    h |= 0;
+  }
+  return Math.abs(h);
+}
+
+function getPersonality(s: SmellPoint): Personality {
+  const h = hashId(s.id + s.keyword);
+  return {
+    haloScale: 0.8 + ((h % 1000) / 1000) * 0.5,
+    trailLength: 0.5 + (((h >> 10) % 1000) / 1000) * 1.1,
+    trailWidth: 0.7 + (((h >> 20) % 1000) / 1000) * 0.6,
+    wobbleAmp: (((h >> 30) % 1000) / 1000),
+    breathRate: 0.18 + (((h >> 40) % 1000) / 1000) * 0.27,
+    coreSize: 0.8 + (((h >> 50) % 1000) / 1000) * 0.4,
+  };
+}
 
 interface SmellCanvasProps {
   map: MapLibreMap | null;
@@ -13,19 +47,15 @@ interface SmellCanvasProps {
 
 export function SmellCanvas({ map }: SmellCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const bloomRef = useRef<HTMLCanvasElement>(null);
   const { windSpeed, windDirAngle } = useAppStore();
 
   useEffect(() => {
     if (!map || !canvasRef.current) return;
-
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
-    const bloomCanvas = bloomRef.current;
-    const bloomCtx = bloomCanvas?.getContext('2d');
-    if (!ctx || !bloomCtx) return;
+    if (!ctx) return;
 
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     const resize = () => {
       const rect = map.getCanvas().getBoundingClientRect();
@@ -35,232 +65,161 @@ export function SmellCanvas({ map }: SmellCanvasProps) {
       canvas.height = h;
       canvas.style.width = rect.width + 'px';
       canvas.style.height = rect.height + 'px';
-      if (bloomCanvas) {
-        bloomCanvas.width = w;
-        bloomCanvas.height = h;
-        bloomCanvas.style.width = rect.width + 'px';
-        bloomCanvas.style.height = rect.height + 'px';
-      }
     };
     resize();
     map.on('resize', resize);
 
     const startTime = performance.now();
     let animId = 0;
-    let frameCount = 0;
 
     const draw = () => {
       const w = canvas.width;
       const h = canvas.height;
       const t = (performance.now() - startTime) / 1000;
-      frameCount++;
 
-      // 调试：第一帧打印信息
-      if (frameCount === 1) {
-        console.log('[SmellCanvas] draw started, w=', w, 'h=', h, 'MOCK_SMELLS.length=', MOCK_SMELLS.length);
-        // 可见调试：画一个红色方块
-        ctx.fillStyle = 'red';
-        ctx.fillRect(10, 10, 100, 100);
-      }
-
-      // 每 60 帧在左上角画一个绿点（可见心跳）
-      if (frameCount % 60 === 0) {
-        ctx.fillStyle = 'lime';
-        ctx.fillRect(0, 0, 8, 8);
-      }
-
-      // 合并 mock 数据 + 用户实时添加的气味
       const userSmells = useAppStore.getState().userSmells;
       const allSmells: SmellPoint[] = [...MOCK_SMELLS, ...userSmells];
+      const lastClick = useAppStore.getState().lastClick;
 
-      // ========== 1. 主画布：加法混合渲染气味点 ==========
       ctx.globalCompositeOperation = 'source-over';
       ctx.clearRect(0, 0, w, h);
 
-      // 风的单位向量
+      // 风向
       const rad = (windDirAngle * Math.PI) / 180;
       const windX = Math.cos(rad);
       const windY = Math.sin(rad);
+      const perpX = -windY;
+      const perpY = windX;
+      const windAngle = Math.atan2(windY, windX);
 
-      // 先绘制到主画布（用加法混合制造发光叠加）
-      ctx.globalCompositeOperation = 'lighter';
-
+      // === Layer 1: 外层光晕（大柔和圆，无方向，缓慢呼吸）===
+      ctx.globalCompositeOperation = 'screen';
       for (const s of allSmells) {
-        // Curl Noise 流场扰动
-        const curl = curlNoise(s.position[0] + t * 0.02, s.position[1] + t * 0.02);
-        const curlStrength = 0.0003;
-        const windStrength = windSpeed * 0.0004;
+        const personality = getPersonality(s);
+        const screen = map.project(s.position);
+        const sx = screen.x * dpr;
+        const sy = screen.y * dpr;
+        if (sx < -120 || sx > w + 120 || sy < -120 || sy > h + 120) continue;
 
-        const windOffset = {
-          lng: s.position[0] + windX * windStrength * Math.sin(t * 0.3 + s.phase) + curl[0] * curlStrength,
-          lat: s.position[1] + windY * windStrength * Math.sin(t * 0.3 + s.phase) + curl[1] * curlStrength,
-        };
-
-        const screen = map.project([windOffset.lng, windOffset.lat]);
-        const x = screen.x * dpr;
-        const y = screen.y * dpr;
-
-        // 离屏检测
-        if (x < -300 || x > w + 300 || y < -300 || y > h + 300) continue;
-
-        // 呼吸动画
-        const breath = 1 + 0.15 * Math.sin(t * 0.5 + s.phase);
-        const baseRadius = 160 * s.intensity * (0.4 + 0.6 * s.age) * breath;
-        const radius = baseRadius * dpr;
-
-        // OKLCH → RGB
         const [r, g, b] = oklchToRgb255(s.oklch.L, s.oklch.C, s.oklch.H);
-        const ageFade = 0.3 + 0.7 * s.age;
+        const ageFade = 0.4 + 0.6 * s.age;
         const baseAlpha = s.intensity * ageFade;
 
-        // === 噪声边缘扰动 ===
-        const noiseSeed = s.position[0] * 0.1 + s.position[1] * 0.1;
-
-        // 外层：大光晕（用噪声制造不规则边缘）
-        const outerR = radius;
-        const outer = ctx.createRadialGradient(x, y, 0, x, y, outerR);
-        outer.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.35})`);
-        outer.addColorStop(0.3, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.2})`);
-        outer.addColorStop(0.7, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.08})`);
-        outer.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
-        ctx.fillStyle = outer;
+        const breath = 1 + 0.06 * Math.sin(t * personality.breathRate + s.phase);
+        const haloR = 50 * personality.haloScale * s.intensity * dpr * breath;
+        const halo = ctx.createRadialGradient(sx, sy, 0, sx, sy, haloR);
+        halo.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.14})`);
+        halo.addColorStop(0.4, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.08})`);
+        halo.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+        ctx.fillStyle = halo;
         ctx.beginPath();
-        // 用噪声扰动圆形边缘
-        const segments = 32;
-        for (let i = 0; i <= segments; i++) {
-          const angle = (i / segments) * Math.PI * 2;
-          const noiseVal = simplex2(
-            Math.cos(angle) * 3 + noiseSeed + t * 0.15,
-            Math.sin(angle) * 3 + noiseSeed + t * 0.1
-          );
-          const noisyR = outerR * (1 + 0.2 * noiseVal);
-          const px = x + Math.cos(angle) * noisyR;
-          const py = y + Math.sin(angle) * noisyR;
-          if (i === 0) ctx.moveTo(px, py);
-          else ctx.lineTo(px, py);
-        }
+        ctx.arc(sx, sy, haloR, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // === Layer 2: 水滴拖尾（沿风向的贝塞尔曲线有机形状）===
+      for (const s of allSmells) {
+        const personality = getPersonality(s);
+        const screen = map.project(s.position);
+        const sx = screen.x * dpr;
+        const sy = screen.y * dpr;
+        if (sx < -150 || sx > w + 150 || sy < -150 || sy > h + 150) continue;
+
+        const [r, g, b] = oklchToRgb255(s.oklch.L, s.oklch.C, s.oklch.H);
+        const ageFade = 0.4 + 0.6 * s.age;
+        const baseAlpha = s.intensity * ageFade;
+
+        // 缓慢呼吸：长度和宽度独立呼吸
+        const lenBreath = 1 + 0.1 * Math.sin(t * personality.breathRate * 0.8 + s.phase);
+        const widBreath = 1 + 0.12 * Math.sin(t * personality.breathRate * 1.3 + s.phase + 1.5);
+        const trailLen = (45 + windSpeed * 65) * personality.trailLength * dpr * lenBreath;
+        const trailWid = 22 * personality.trailWidth * dpr * widBreath;
+
+        // 垂直方向缓慢摆动
+        const wobble = personality.wobbleAmp * 5 * Math.sin(t * 0.35 + s.phase) * dpr;
+
+        ctx.save();
+        ctx.translate(sx + perpX * wobble, sy + perpY * wobble);
+        ctx.rotate(windAngle);
+
+        // 线性渐变：从源头（满色）到尖端（透明）
+        const grad = ctx.createLinearGradient(0, 0, trailLen, 0);
+        grad.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.32})`);
+        grad.addColorStop(0.4, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.20})`);
+        grad.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        // 起点：源头（圆形端）
+        ctx.moveTo(0, -trailWid);
+        // 上边曲线到尖端
+        ctx.bezierCurveTo(
+          trailLen * 0.3, -trailWid * 1.15,
+          trailLen * 0.7, -trailWid * 0.45,
+          trailLen, 0
+        );
+        // 下边曲线回到源头
+        ctx.bezierCurveTo(
+          trailLen * 0.7, trailWid * 0.45,
+          trailLen * 0.3, trailWid * 1.15,
+          0, trailWid
+        );
         ctx.closePath();
         ctx.fill();
 
-        // 中层：稍锐的色团
-        const midR = radius * 0.5;
-        const mid = ctx.createRadialGradient(x, y, 0, x, y, midR);
-        mid.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.6})`);
-        mid.addColorStop(0.5, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.3})`);
-        mid.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
-        ctx.fillStyle = mid;
-        ctx.beginPath();
-        ctx.arc(x, y, midR, 0, Math.PI * 2);
-        ctx.fill();
+        ctx.restore();
+      }
 
-        // 内核：明亮中心
-        const coreR = radius * 0.18;
-        const core = ctx.createRadialGradient(x, y, 0, x, y, coreR);
-        const brightR = Math.min(255, r + 50);
-        const brightG = Math.min(255, g + 50);
-        const brightB = Math.min(255, b + 50);
-        core.addColorStop(0, `rgba(${brightR}, ${brightG}, ${brightB}, ${Math.min(1, baseAlpha * 1.2)})`);
+      // === Layer 3: 核心（小亮圆点，极弱呼吸）===
+      ctx.globalCompositeOperation = 'source-over';
+      for (const s of allSmells) {
+        const screen = map.project(s.position);
+        const sx = screen.x * dpr;
+        const sy = screen.y * dpr;
+        if (sx < -50 || sx > w + 50 || sy < -50 || sy > h + 50) continue;
+
+        const personality = getPersonality(s);
+        const [r, g, b] = oklchToRgb255(s.oklch.L, s.oklch.C, s.oklch.H);
+        const ageFade = 0.4 + 0.6 * s.age;
+        const baseAlpha = s.intensity * ageFade;
+        const breath = 1 + 0.04 * Math.sin(t * 0.31 + s.phase);
+        const coreR = 5 * s.intensity * personality.coreSize * dpr * breath;
+        const core = ctx.createRadialGradient(sx, sy, 0, sx, sy, coreR);
+        core.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${Math.min(0.8, baseAlpha * 0.8)})`);
         core.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
         ctx.fillStyle = core;
         ctx.beginPath();
-        ctx.arc(x, y, coreR, 0, Math.PI * 2);
+        ctx.arc(sx, sy, coreR, 0, Math.PI * 2);
         ctx.fill();
       }
 
-      // ========== 2. Bloom 辉光效果 ==========
-      // 用离屏 Canvas 做高斯模糊叠加
-      bloomCtx.globalCompositeOperation = 'source-over';
-      bloomCtx.clearRect(0, 0, w, h);
-
-      // 把主画布内容复制到 bloom 画布
-      bloomCtx.drawImage(canvas, 0, 0);
-
-      // 水平模糊
-      bloomCtx.globalCompositeOperation = 'source-over';
-      const blurPasses = 3;
-      for (let pass = 0; pass < blurPasses; pass++) {
-        const imageData = bloomCtx.getImageData(0, 0, w, h);
-        const data = imageData.data;
-        const temp = new Uint8ClampedArray(data);
-
-        // 水平方向
-        const radius_blur = 8;
-        for (let y2 = 0; y2 < h; y2++) {
-          for (let x2 = 0; x2 < w; x2++) {
-            let r_acc = 0, g_acc = 0, b_acc = 0, a_acc = 0;
-            let weightSum = 0;
-            for (let dx = -radius_blur; dx <= radius_blur; dx++) {
-              const sx = x2 + dx;
-              if (sx < 0 || sx >= w) continue;
-              const idx = (y2 * w + sx) * 4;
-              const weight = 1 - Math.abs(dx) / radius_blur;
-              r_acc += temp[idx] * weight;
-              g_acc += temp[idx + 1] * weight;
-              b_acc += temp[idx + 2] * weight;
-              a_acc += temp[idx + 3] * weight;
-              weightSum += weight;
-            }
-            const idx = (y2 * w + x2) * 4;
-            data[idx] = r_acc / weightSum;
-            data[idx + 1] = g_acc / weightSum;
-            data[idx + 2] = b_acc / weightSum;
-            data[idx + 3] = a_acc / weightSum;
+      // === Click ripple ===
+      if (lastClick) {
+        const clickT = (Date.now() - lastClick.t) / 1000;
+        if (clickT < 2.0) {
+          const clickScreen = map.project([lastClick.lng, lastClick.lat]);
+          const cx = clickScreen.x * dpr;
+          const cy = clickScreen.y * dpr;
+          if (cx > -200 && cx < w + 200 && cy > -200 && cy < h + 200) {
+            const ringT = clickT / 2.0;
+            const ringR = (15 + ringT * 160) * dpr;
+            const ringAlpha = (1 - ringT) * (1 - ringT) * 0.55;
+            ctx.globalCompositeOperation = 'screen';
+            ctx.beginPath();
+            ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
+            ctx.strokeStyle = `rgba(180, 200, 220, ${ringAlpha})`;
+            ctx.lineWidth = 1.4 * dpr;
+            ctx.stroke();
           }
         }
-
-        // 垂直方向
-        const temp2 = new Uint8ClampedArray(data);
-        for (let x2 = 0; x2 < w; x2++) {
-          for (let y2 = 0; y2 < h; y2++) {
-            let r_acc = 0, g_acc = 0, b_acc = 0, a_acc = 0;
-            let weightSum = 0;
-            for (let dy = -radius_blur; dy <= radius_blur; dy++) {
-              const sy = y2 + dy;
-              if (sy < 0 || sy >= h) continue;
-              const idx = (sy * w + x2) * 4;
-              const weight = 1 - Math.abs(dy) / radius_blur;
-              r_acc += temp2[idx] * weight;
-              g_acc += temp2[idx + 1] * weight;
-              b_acc += temp2[idx + 2] * weight;
-              a_acc += temp2[idx + 3] * weight;
-              weightSum += weight;
-            }
-            const idx = (y2 * w + x2) * 4;
-            data[idx] = r_acc / weightSum;
-            data[idx + 1] = g_acc / weightSum;
-            data[idx + 2] = b_acc / weightSum;
-            data[idx + 3] = a_acc / weightSum;
-          }
-        }
-
-        bloomCtx.putImageData(imageData, 0, 0);
-      }
-
-      // ========== 3. 合成：主画布 + Bloom 辉光 ==========
-      // 用 lighter 模式叠加辉光到主画布
-      ctx.globalCompositeOperation = 'lighter';
-      ctx.drawImage(bloomCanvas, 0, 0);
-      ctx.globalCompositeOperation = 'source-over';
-
-      // 调试信息
-      if (frameCount % 30 === 0) {
-        // console.log(`[SmellCanvas] frame=${frameCount} smells=${allSmells.length}`);
       }
 
       animId = requestAnimationFrame(draw);
     };
 
-    // 等待地图首次渲染完成再开始
-    const onLoad = () => {
-      console.log('[SmellCanvas] starting render loop, smells:', MOCK_SMELLS.length);
-      draw();
-    };
-
-    if (map.loaded()) {
-      onLoad();
-    } else {
-      map.once('load', onLoad);
-    }
+    const onLoad = () => draw();
+    if (map.loaded()) onLoad();
+    else map.once('load', onLoad);
 
     return () => {
       cancelAnimationFrame(animId);
@@ -269,19 +228,10 @@ export function SmellCanvas({ map }: SmellCanvasProps) {
   }, [map, windSpeed, windDirAngle]);
 
   return (
-    <>
-      {/* Bloom 离屏画布（不可见但保持尺寸） */}
-      <canvas
-        ref={bloomRef}
-        className="absolute inset-0 pointer-events-none"
-        style={{ zIndex: 14, opacity: 0, pointerEvents: 'none' }}
-      />
-      {/* 主渲染画布 */}
-      <canvas
-        ref={canvasRef}
-        className="absolute inset-0 pointer-events-none"
-        style={{ zIndex: 15 }}
-      />
-    </>
+    <canvas
+      ref={canvasRef}
+      className="absolute inset-0 pointer-events-none"
+      style={{ zIndex: 15 }}
+    />
   );
 }

@@ -2,5 +2,8 @@ node_modules/
 dist/
 .trae/
 *.tsbuildinfo
-gen_ladybug.py
-gen_ladybug.sh
+.env
+vite.err
+vite.log
+port.txt
+nc.txt

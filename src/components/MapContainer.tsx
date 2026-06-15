@@ -1,85 +1,92 @@
-// MapContainer - MapLibre 地图 + SmellCanvas 覆盖层
-import { useEffect, useRef, useState } from 'react';
-import maplibregl, { type Map as MapLibreMap } from 'maplibre-gl';
+// MapContainer — 地图容器，管理 MapLibre 实例和 WebGL 气味层
+import { useEffect, useRef, useCallback } from 'react';
+import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { SmellCanvas } from './SmellCanvas';
+import { SmellLayer } from '../layers/SmellLayer';
+import { UserMarkers } from './UserMarkers';
+import type { SmellPoint } from '../data/mockSmells';
 import { HARBIN_CENTER, HARBIN_ZOOM } from '../data/mockSmells';
-import { useAppStore } from '../store/useMapStore';
 
-// CartoDB Positron 浅色底图
-const POSITRON_STYLE = {
-  version: 8 as const,
-  glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
-  sources: {
-    'carto-positron': {
-      type: 'raster' as const,
-      tiles: [
-        'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-        'https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-        'https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-        'https://d.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-      ],
-      tileSize: 256,
-      attribution:
-        '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
-    },
-  },
-  layers: [
-    {
-      id: 'positron-tiles',
-      type: 'raster' as const,
-      source: 'carto-positron',
-      minzoom: 0,
-      maxzoom: 22,
-    },
-  ],
-};
+// OpenStreetMap 矢量风格（免费、专业、无需 API key）
+const STYLE = 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json';
 
-export function MapContainer() {
+interface Props {
+  smells: SmellPoint[];
+  onMapClick: (pos: { lng: number; lat: number; x: number; y: number }) => void;
+}
+
+export function MapContainer({ smells, onMapClick }: Props) {
+  const mapRef = useRef<maplibregl.Map | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<MapLibreMap | null>(null);
-  const [map, setMap] = useState<MapLibreMap | null>(null);
-  const { openModal, triggerClickRipple } = useAppStore();
+  const layerRef = useRef<SmellLayer | null>(null);
 
+  // 初始化地图
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
-    const m = new maplibregl.Map({
+    const map = new maplibregl.Map({
       container: containerRef.current,
-      style: POSITRON_STYLE,
+      style: STYLE,
       center: HARBIN_CENTER,
       zoom: HARBIN_ZOOM,
+      attributionControl: false,
+      maxZoom: 18,
       minZoom: 9,
-      maxZoom: 16,
-      pitch: 0,
-      bearing: 0,
-      attributionControl: { compact: true },
-      logoPosition: 'bottom-right',
     });
 
-    mapRef.current = m;
-
-    // 立即设置 map 实例，SmellCanvas 会自己处理加载状态
-    setMap(m);
-
-    // 点击地图：弹出输入框
-    m.on('click', (e) => {
-      const { lng, lat } = e.lngLat;
-      console.log('[MapContainer] click at', lng, lat);
-      openModal(lng, lat);
-      triggerClickRipple(lng, lat);
+    map.on('load', () => {
+      const layer = new SmellLayer({
+        smells,
+        windSpeed: 0.45,
+        windDir: [0.6, -0.8],
+      });
+      map.addLayer(layer);
+      layerRef.current = layer;
     });
+
+    // 点击地图弹出气味输入
+    map.on('click', (e) => {
+      const rect = map.getCanvas().getBoundingClientRect();
+      onMapClick({
+        lng: e.lngLat.lng,
+        lat: e.lngLat.lat,
+        x: e.originalEvent.clientX,
+        y: e.originalEvent.clientY,
+      });
+    });
+
+    mapRef.current = map;
 
     return () => {
+      map.remove();
       mapRef.current = null;
-      m.remove();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 气味数据变化时更新 layer
+  useEffect(() => {
+    if (layerRef.current) {
+      layerRef.current.setSmells(smells);
+    }
+  }, [smells]);
+
+  // 双击放大地图
+  const handleDoubleClick = useCallback(() => {
+    if (mapRef.current) {
+      mapRef.current.zoomIn({ duration: 300 });
+    }
   }, []);
 
   return (
-    <div className="absolute inset-0" style={{ background: 'oklch(0.97 0.01 80)' }}>
-      <div ref={containerRef} className="absolute inset-0" />
-      <SmellCanvas map={map} />
+    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      <div
+        ref={containerRef}
+        onDoubleClick={handleDoubleClick}
+        style={{ width: '100%', height: '100%', cursor: 'crosshair' }}
+      />
+      {/* 用户标记（缩放时显示） */}
+      <UserMarkers map={mapRef.current} smells={smells} />
     </div>
   );
 }

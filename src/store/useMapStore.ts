@@ -57,6 +57,9 @@ export const useAppStore = create<AppState>((set) => ({
       age: 0.95,
       size: 80,
       phase: Math.random() * Math.PI * 2,
+      avatar: '👤',
+      username: '我',
+      message: `我闻到了${keyword}的味道`,
     };
     return { userSmells: [...state.userSmells, newSmell] };
   }),
